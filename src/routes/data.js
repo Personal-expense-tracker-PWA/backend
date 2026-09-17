@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import db from '../db/index.js';
-import { getSetting, setSetting } from '../db/settings.js';
+import { query, withTransaction, NOW_TEXT } from '../db/index.js';
 import { isValidDate, isValidAmount, isValidPaymentMethod, sanitizeNote, sanitizeName } from '../utils/validate.js';
 
 const router = Router();
@@ -11,29 +10,28 @@ function toCsvValue(value) {
   return str;
 }
 
-router.get('/export/csv', (req, res) => {
+router.get('/export/csv', async (req, res) => {
   const { start, end } = req.query;
   const clauses = [];
-  const params = {};
+  const params = [];
 
   if (start && isValidDate(start)) {
-    clauses.push('e.date >= @start');
-    params.start = start;
+    params.push(start);
+    clauses.push(`e.date >= $${params.length}`);
   }
   if (end && isValidDate(end)) {
-    clauses.push('e.date <= @end');
-    params.end = end;
+    params.push(end);
+    clauses.push(`e.date <= $${params.length}`);
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-  const rows = db
-    .prepare(
-      `SELECT e.date, e.amount, c.name AS category, e.payment_method, e.note
-       FROM expenses e JOIN categories c ON c.id = e.category_id
-       ${where}
-       ORDER BY e.date ASC, e.id ASC`
-    )
-    .all(params);
+  const rows = await query(
+    `SELECT e.date, e.amount, c.name AS category, e.payment_method, e.note
+     FROM expenses e JOIN categories c ON c.id = e.category_id
+     ${where}
+     ORDER BY e.date ASC, e.id ASC`,
+    params
+  );
 
   const header = ['Date', 'Amount', 'Category', 'Payment Method', 'Note'];
   const lines = [header.join(',')];
@@ -47,10 +45,12 @@ router.get('/export/csv', (req, res) => {
   res.send(csv);
 });
 
-router.get('/export/json', (req, res) => {
-  const expenses = db.prepare('SELECT * FROM expenses ORDER BY id ASC').all();
-  const categories = db.prepare('SELECT * FROM categories ORDER BY id ASC').all();
-  const settings = db.prepare('SELECT key, value FROM settings').all();
+router.get('/export/json', async (req, res) => {
+  const [expenses, categories, settings] = await Promise.all([
+    query('SELECT * FROM expenses ORDER BY id ASC'),
+    query('SELECT * FROM categories ORDER BY id ASC'),
+    query('SELECT key, value FROM settings'),
+  ]);
 
   res.json({
     exportedAt: new Date().toISOString(),
@@ -61,7 +61,7 @@ router.get('/export/json', (req, res) => {
   });
 });
 
-router.post('/import/json', (req, res) => {
+router.post('/import/json', async (req, res) => {
   const { expenses, categories } = req.body || {};
 
   if (!Array.isArray(expenses) || !Array.isArray(categories)) {
@@ -79,37 +79,37 @@ router.post('/import/json', (req, res) => {
     }
   }
 
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM expenses').run();
-    db.prepare('DELETE FROM categories').run();
-
-    const catIdMap = new Map();
-    const insertCat = db.prepare('INSERT INTO categories (name, icon, is_default) VALUES (?, ?, ?)');
-    for (const c of categories) {
-      const info = insertCat.run(sanitizeName(c.name) || 'Other', c.icon || '📦', c.is_default ? 1 : 0);
-      if (c.id !== undefined) catIdMap.set(c.id, info.lastInsertRowid);
-    }
-
-    const insertExp = db.prepare(
-      `INSERT INTO expenses (date, amount, category_id, payment_method, note, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))`
-    );
-    for (const e of expenses) {
-      const mappedCategoryId = catIdMap.get(e.category_id) || [...catIdMap.values()][0];
-      insertExp.run(
-        e.date,
-        Math.round(Number(e.amount) * 100) / 100,
-        mappedCategoryId,
-        e.payment_method,
-        sanitizeNote(e.note),
-        e.created_at || null,
-        e.updated_at || null
-      );
-    }
-  });
-
   try {
-    tx();
+    await withTransaction(async (client) => {
+      await client.query('DELETE FROM expenses');
+      await client.query('DELETE FROM categories');
+
+      const catIdMap = new Map();
+      for (const c of categories) {
+        const { rows } = await client.query(
+          'INSERT INTO categories (name, icon, is_default) VALUES ($1, $2, $3) RETURNING id',
+          [sanitizeName(c.name) || 'Other', c.icon || '📦', c.is_default ? 1 : 0]
+        );
+        if (c.id !== undefined) catIdMap.set(c.id, rows[0].id);
+      }
+
+      for (const e of expenses) {
+        const mappedCategoryId = catIdMap.get(e.category_id) || [...catIdMap.values()][0];
+        await client.query(
+          `INSERT INTO expenses (date, amount, category_id, payment_method, note, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, COALESCE($6, ${NOW_TEXT}), COALESCE($7, ${NOW_TEXT}))`,
+          [
+            e.date,
+            Math.round(Number(e.amount) * 100) / 100,
+            mappedCategoryId,
+            e.payment_method,
+            sanitizeNote(e.note),
+            e.created_at || null,
+            e.updated_at || null,
+          ]
+        );
+      }
+    });
   } catch (err) {
     return res.status(400).json({ error: 'Failed to import backup: ' + err.message });
   }

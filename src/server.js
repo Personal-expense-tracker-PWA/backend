@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
+import { initDb } from './db/index.js';
+
 import { requireAuth } from './middleware/auth.js';
 import authRoutes from './routes/auth.js';
 import expenseRoutes from './routes/expenses.js';
@@ -46,6 +48,8 @@ app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+await initDb();
 
 app.listen(PORT, () => {
   console.log(`Expense tracker API listening on port ${PORT}`);

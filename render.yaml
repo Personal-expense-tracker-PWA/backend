@@ -5,16 +5,13 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
-    disk:
-      name: expense-data
-      mountPath: /app/data
-      sizeGB: 1
+    healthCheckPath: /api/health
     envVars:
-      - key: PORT
-        value: 4000
-      - key: DB_PATH
-        value: /app/data/expenses.db
+      # Postgres connection string (e.g. from Neon, Supabase or Render Postgres)
+      - key: DATABASE_URL
+        sync: false
       - key: JWT_SECRET
-        generateValue: true
+        sync: false
+      # Comma-separated list of allowed frontend origins
       - key: CORS_ORIGIN
         sync: false

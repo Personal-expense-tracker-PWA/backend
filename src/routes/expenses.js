@@ -1,9 +1,10 @@
 import { Router } from 'express';
-import db from '../db/index.js';
+import { query, queryOne, NOW_TEXT } from '../db/index.js';
 import {
   isValidDate,
   isValidAmount,
   isValidPaymentMethod,
+  parseId,
   sanitizeNote,
 } from '../utils/validate.js';
 
@@ -15,51 +16,47 @@ const EXPENSE_SELECT = `
   JOIN categories c ON c.id = e.category_id
 `;
 
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const { start, end, category_id, payment_method, search, month, year } = req.query;
 
   const clauses = [];
-  const params = {};
+  const params = [];
+  const param = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
 
   if (month && year) {
     const m = String(Number(month)).padStart(2, '0');
-    clauses.push("strftime('%Y-%m', e.date) = @ym");
-    params.ym = `${year}-${m}`;
+    clauses.push(`LEFT(e.date, 7) = ${param(`${year}-${m}`)}`);
   } else {
     if (start && isValidDate(start)) {
-      clauses.push('e.date >= @start');
-      params.start = start;
+      clauses.push(`e.date >= ${param(start)}`);
     }
     if (end && isValidDate(end)) {
-      clauses.push('e.date <= @end');
-      params.end = end;
+      clauses.push(`e.date <= ${param(end)}`);
     }
   }
 
   if (category_id) {
-    clauses.push('e.category_id = @category_id');
-    params.category_id = Number(category_id);
+    clauses.push(`e.category_id = ${param(parseId(category_id))}`);
   }
 
   if (payment_method) {
-    clauses.push('e.payment_method = @payment_method');
-    params.payment_method = payment_method;
+    clauses.push(`e.payment_method = ${param(payment_method)}`);
   }
 
   if (search) {
-    clauses.push('e.note LIKE @search');
-    params.search = `%${search}%`;
+    clauses.push(`e.note ILIKE ${param(`%${search}%`)}`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const rows = db
-    .prepare(`${EXPENSE_SELECT} ${where} ORDER BY e.date DESC, e.id DESC`)
-    .all(params);
+  const rows = await query(`${EXPENSE_SELECT} ${where} ORDER BY e.date DESC, e.id DESC`, params);
 
   res.json(rows);
 });
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { date, amount, category_id, payment_method, note } = req.body || {};
 
   if (!isValidDate(date)) return res.status(400).json({ error: 'Valid date (YYYY-MM-DD) is required' });
@@ -68,31 +65,32 @@ router.post('/', (req, res) => {
     return res.status(400).json({ error: 'Invalid payment method' });
   }
 
-  const category = db.prepare('SELECT id FROM categories WHERE id = ?').get(Number(category_id));
+  const categoryId = parseId(category_id);
+  const category = categoryId && (await queryOne('SELECT id FROM categories WHERE id = $1', [categoryId]));
   if (!category) return res.status(400).json({ error: 'Invalid category' });
 
   const roundedAmount = Math.round(amount * 100) / 100;
   const cleanNote = sanitizeNote(note);
 
-  const info = db
-    .prepare(
-      `INSERT INTO expenses (date, amount, category_id, payment_method, note)
-       VALUES (?, ?, ?, ?, ?)`
-    )
-    .run(date, roundedAmount, category.id, payment_method, cleanNote);
+  const inserted = await queryOne(
+    `INSERT INTO expenses (date, amount, category_id, payment_method, note)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [date, roundedAmount, category.id, payment_method, cleanNote]
+  );
 
-  const row = db.prepare(`${EXPENSE_SELECT} WHERE e.id = ?`).get(info.lastInsertRowid);
+  const row = await queryOne(`${EXPENSE_SELECT} WHERE e.id = $1`, [inserted.id]);
   res.status(201).json(row);
 });
 
-router.put('/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+router.put('/:id', async (req, res) => {
+  const id = parseId(req.params.id);
+  const existing = id && (await queryOne('SELECT * FROM expenses WHERE id = $1', [id]));
   if (!existing) return res.status(404).json({ error: 'Expense not found' });
 
   const date = req.body?.date !== undefined ? req.body.date : existing.date;
   const amount = req.body?.amount !== undefined ? req.body.amount : existing.amount;
-  const categoryId = req.body?.category_id !== undefined ? Number(req.body.category_id) : existing.category_id;
+  const categoryId = req.body?.category_id !== undefined ? parseId(req.body.category_id) : existing.category_id;
   const paymentMethod = req.body?.payment_method !== undefined ? req.body.payment_method : existing.payment_method;
   const note = req.body?.note !== undefined ? sanitizeNote(req.body.note) : existing.note;
 
@@ -102,27 +100,27 @@ router.put('/:id', (req, res) => {
     return res.status(400).json({ error: 'Invalid payment method' });
   }
 
-  const category = db.prepare('SELECT id FROM categories WHERE id = ?').get(categoryId);
+  const category = categoryId && (await queryOne('SELECT id FROM categories WHERE id = $1', [categoryId]));
   if (!category) return res.status(400).json({ error: 'Invalid category' });
 
   const roundedAmount = Math.round(amount * 100) / 100;
 
-  db.prepare(
+  await query(
     `UPDATE expenses
-     SET date = ?, amount = ?, category_id = ?, payment_method = ?, note = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(date, roundedAmount, category.id, paymentMethod, note, id);
+     SET date = $1, amount = $2, category_id = $3, payment_method = $4, note = $5, updated_at = ${NOW_TEXT}
+     WHERE id = $6`,
+    [date, roundedAmount, category.id, paymentMethod, note, id]
+  );
 
-  const row = db.prepare(`${EXPENSE_SELECT} WHERE e.id = ?`).get(id);
+  const row = await queryOne(`${EXPENSE_SELECT} WHERE e.id = $1`, [id]);
   res.json(row);
 });
 
-router.delete('/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM expenses WHERE id = ?').get(id);
-  if (!existing) return res.status(404).json({ error: 'Expense not found' });
+router.delete('/:id', async (req, res) => {
+  const id = parseId(req.params.id);
+  const deleted = id && (await queryOne('DELETE FROM expenses WHERE id = $1 RETURNING id', [id]));
+  if (!deleted) return res.status(404).json({ error: 'Expense not found' });
 
-  db.prepare('DELETE FROM expenses WHERE id = ?').run(id);
   res.json({ success: true });
 });
 

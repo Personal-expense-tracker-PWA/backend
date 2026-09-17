@@ -1,20 +1,15 @@
-FROM node:20-slim
+FROM node:24-slim
 
 WORKDIR /app
-
-# better-sqlite3 needs build tools to compile its native binding
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 COPY . .
 
-RUN mkdir -p /app/data
-VOLUME ["/app/data"]
-
 ENV PORT=4000
-ENV DB_PATH=/app/data/expenses.db
 EXPOSE 4000
 
+USER node
 CMD ["node", "src/server.js"]

@@ -27,4 +27,10 @@ export function sanitizeName(value) {
   return value.replace(/[<>]/g, '').trim().slice(0, 50);
 }
 
+// Parses a positive integer id that fits a Postgres INTEGER column, or returns null.
+export function parseId(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 && n <= 2147483647 ? n : null;
+}
+
 export const PAYMENT_METHOD_LIST = [...PAYMENT_METHODS];
